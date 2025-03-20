@@ -80,7 +80,7 @@ class VOS():
         log_likelihood = mode.log_prob(latents)
         return log_likelihood
 
-    def select_log_epsilon(self, t:int = 200): # t corresponds to the lowest ~1% of ID data likelihoods
+    def select_log_epsilon(self, t:int = 500): # t corresponds to the lowest ~5% of ID data likelihoods
         assert t > 0, "t must be a positive integer!"
         id_likelihoods = torch.tensor([])
         for key in self.queue.keys():
@@ -116,24 +116,25 @@ class VOS():
         return energy_scores
 
     def uncertainty_loss(self):
-        id_loss, ood_loss = 0., 0.
+        id_samples = torch.Tensor([])
         for key in self.queue.keys():
-            id_points = torch.stack(self.queue[key])
-            # TODO: Switch ID logits to being calculated through the backbone directly
-            # TODO: Also ensure that OOD latent losses are being properly backpropped
-            id_logits = self.backbone(id_points)
+            new_samples = torch.stack(self.queue[key])
+            id_samples = torch.cat((id_samples, new_samples))
+        id_samples = id_samples[torch.randperm(id_samples.shape[0])]
 
-            ood_latents = self.ood_queue[key]
-            classifier = list(self.backbone.children())[-1]
-            ood_logits = classifier(ood_latents)
+        id_logits = self.backbone(id_samples)
 
-            id_energies, ood_energies = self.free_energy(id_logits), self.free_energy(ood_logits)
-            id_energy_surface, ood_energy_surface = self.ood_detector(id_energies), self.ood_detector(ood_energies)
+        ood_latents = self.ood_queue[key]
+        classifier = list(self.backbone.children())[-1]
+        ood_logits = classifier(ood_latents)
 
-            id_loss += torch.mean(-torch.log(torch.exp(-id_energy_surface)/(1 + torch.exp(-id_energy_surface))))
-            ood_loss += torch.mean(-torch.log(1/(1 + torch.exp(-ood_energy_surface))))
+        id_energies, ood_energies = self.free_energy(id_logits), self.free_energy(ood_logits)
+        id_energy_surface, ood_energy_surface = self.ood_detector(id_energies), self.ood_detector(ood_energies)
 
-        return (id_loss + ood_loss)/len(list(self.queue.keys()))
+        id_loss = torch.mean(-torch.log(torch.exp(-id_energy_surface)/(1 + torch.exp(-id_energy_surface))))
+        ood_loss = torch.mean(-torch.log(1/(1 + torch.exp(-ood_energy_surface))))
+
+        return (id_loss + ood_loss)
 
     def update_stripped_backbone(self):
         backbone_layers = list(self.backbone.children())
@@ -141,12 +142,12 @@ class VOS():
         self.stripped_backbone = nn.Sequential(*backbone_layers)
         return None
 
-    def train(self, iterations = 50, lr = 1e-4, beta = 0.1, ood_iterations = 10):
+    def train(self, iterations = 50, lr = 1e-3, beta = 0.1, ood_iterations = 3):
         # Give a for loop for the iterations, and define the necessary stuff (optimizers, etc)
         self.backbone.train()
-        backbone_opt = torch.optim.Adam(self.backbone.parameters(), lr = lr)
+        opt = torch.optim.Adam(self.backbone.parameters(), lr = lr)
         ood_opt = torch.optim.Adam(self.ood_detector.parameters(), lr = lr)
-        backbone_opt_scheduler = ReduceLROnPlateau(backbone_opt, factor = 0.5)
+        opt_scheduler = ReduceLROnPlateau(opt, factor = 0.5)
         ood_opt_scheduler = ReduceLROnPlateau(ood_opt, factor = 0.5)
         class_criterion = nn.CrossEntropyLoss()
         for iteration in range(iterations):
@@ -173,7 +174,7 @@ class VOS():
             id_samples = id_samples[idxs]
             id_labels = id_labels[idxs]
 
-            backbone_opt.zero_grad()
+            opt.zero_grad()
 
             outputs = self.backbone(id_samples)
             class_loss = class_criterion(outputs, F.one_hot(id_labels).float())
@@ -181,8 +182,8 @@ class VOS():
 
             total_loss = class_loss + beta*uncertainty_loss
             total_loss.backward()
-            backbone_opt.step()
-            backbone_opt_scheduler.step(total_loss)
+            opt.step()
+            opt_scheduler.step(total_loss)
 
             # Update stripped backbone network
             self.update_stripped_backbone()
@@ -196,7 +197,6 @@ class VOS():
                 average_uncertainty_loss += uncertainty_loss
             average_uncertainty_loss = average_uncertainty_loss/ood_iterations
             ood_opt_scheduler.step(average_uncertainty_loss)
-
 
             print(f"Classification Loss: {class_loss}")
             print(f"Uncertainty Loss: {average_uncertainty_loss}")
