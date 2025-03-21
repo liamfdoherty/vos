@@ -7,7 +7,7 @@ import random
 from copy import deepcopy
 
 class VOS():
-    def __init__(self, backbone, ood_detector, data, queue_size = 1024):
+    def __init__(self, backbone, ood_detector, data, queue_size = 1024, device = "cuda"):
         # Set up backbone and stripped backbone pretrained architectures
         self.backbone = backbone
         backbone_layers = list(self.backbone.children())
@@ -15,8 +15,13 @@ class VOS():
         del backbone_layers[-1]
         self.stripped_backbone = nn.Sequential(*backbone_layers)
 
+        # Set up device and move networks there
+        self.device = torch.device(device)
+        self.backbone = self.backbone.to(self.device)
+        self.stripped_backbone = self.stripped_backbone.to(self.device)
+
         # Set up OOD detector architecture
-        self.ood_detector = ood_detector
+        self.ood_detector = ood_detector.to(self.device)
 
         # Define dataset and split according to class label
         samples, targets = data.tensors[0], data.tensors[1]
@@ -32,8 +37,8 @@ class VOS():
         self.ood_queue = {key:[] for key in targets.tolist()}
 
         # Initialize the underlying statistical distributions (class-conditioned multivariate Gaussians)
-        self.means = {key:torch.zeros(self.feature_dim) for key in self.queue.keys()}
-        self.cov = torch.eye(self.feature_dim)
+        self.means = {key:torch.zeros(self.feature_dim).to(self.device) for key in self.queue.keys()}
+        self.cov = torch.eye(self.feature_dim).to(self.device)
         self.cov_components = {key:torch.zeros(self.cov.shape) for key in self.queue.keys()}
         self.class_conditional_modes = {key:MultivariateNormal(self.means[key], self.cov) for key in self.queue.keys()}
 
@@ -47,6 +52,7 @@ class VOS():
     def update_gmm(self):
         for key in self.queue.keys():
             class_samples = torch.stack(self.queue[key])
+            class_samples = class_samples.to(self.device)
             latent_embeddings = self.stripped_backbone(class_samples).squeeze()
 
             # Step 1: Get per class latent representation means
@@ -54,24 +60,24 @@ class VOS():
 
             # Step 2: Get components from the inner sum of the empirical covariance
             centered_embeddings = latent_embeddings - self.means[key]
-            cov_component = torch.zeros(self.cov.shape)
+            cov_component = torch.zeros(self.cov.shape, device = self.device)
             for column in centered_embeddings:
                 cov_component += torch.outer(column, column)
             cov_component = cov_component/(self.queue_size - 1)
-            cov_component = cov_component.detach() + 0.001*torch.eye(self.cov.shape[0])
+            cov_component = cov_component.detach() + 0.001*torch.eye(self.cov.shape[0], device = self.device)
             self.cov_components[key] = cov_component
 
         # Step 3: Empirically estimate tied covariance
-        cov = torch.zeros(self.cov.shape)
+        cov = torch.zeros(self.cov.shape, device = self.device)
         for key in self.cov_components.keys():
             cov += self.cov_components[key]
         cov = cov/(len(self.cov_components))
-        self.cov = cov.detach() + 0.001*torch.eye(cov.shape[0])
+        self.cov = cov.detach() + 0.001*torch.eye(cov.shape[0], device = self.device)
 
         # Step 4: Update the GMM state with computed values. Here we are using local, not tied, covariance.
         for key in self.queue.keys():
-            self.class_conditional_modes[key].loc = self.means[key]
-            self.class_conditional_modes[key].cov = self.cov_components[key]
+            self.class_conditional_modes[key].loc = self.means[key].to(self.device)
+            self.class_conditional_modes[key].cov = self.cov_components[key].to(self.device)
 
         return None
     
@@ -80,11 +86,12 @@ class VOS():
         log_likelihood = mode.log_prob(latents)
         return log_likelihood
 
-    def select_log_epsilon(self, t:int = 500): # t corresponds to the lowest ~5% of ID data likelihoods
+    def select_log_epsilon(self, t:int = 100): # t corresponds to the lowest ~1% of ID data likelihoods
         assert t > 0, "t must be a positive integer!"
-        id_likelihoods = torch.tensor([])
+        id_likelihoods = torch.tensor([], device = self.device)
         for key in self.queue.keys():
             id_points = torch.stack(self.queue[key])
+            id_points = id_points.to(self.device)
             latents = self.stripped_backbone(id_points).squeeze().detach()
             likelihoods = self.compute_gmm_log_likelihood(latents, key)
             id_likelihoods = torch.cat((id_likelihoods, likelihoods), dim = 0)
@@ -92,14 +99,16 @@ class VOS():
         return log_epsilon
 
     def sample_ood(self, max_iterations = 1000, lr = 5e-3):
+        self.stripped_backbone = self.stripped_backbone.to(self.device)
         for key in self.queue.keys():
             samples = deepcopy(self.queue[key])
             samples = torch.stack(samples)
+            samples = samples.to(self.device)
             latents = self.stripped_backbone(samples).detach().squeeze()
             latents.requires_grad = True
             opt = torch.optim.Adam([latents], lr = lr)
             eps = self.select_log_epsilon()
-            criterion = lambda x: torch.max(torch.Tensor([0.]),
+            criterion = lambda x: torch.max(torch.tensor([0.], device = self.device),
                                             self.compute_gmm_log_likelihood(x, key) - eps)
 
             for iteration in range(max_iterations):
@@ -121,6 +130,7 @@ class VOS():
             new_samples = torch.stack(self.queue[key])
             id_samples = torch.cat((id_samples, new_samples))
         id_samples = id_samples[torch.randperm(id_samples.shape[0])]
+        id_samples = id_samples.to(self.device)
 
         id_logits = self.backbone(id_samples)
 
@@ -145,6 +155,8 @@ class VOS():
     def train(self, iterations = 50, lr = 1e-3, beta = 0.1, ood_iterations = 3):
         # Give a for loop for the iterations, and define the necessary stuff (optimizers, etc)
         self.backbone.train()
+        self.backbone.to(self.device)
+        self.ood_detector.to(self.device)
         opt = torch.optim.Adam(self.backbone.parameters(), lr = lr)
         ood_opt = torch.optim.Adam(self.ood_detector.parameters(), lr = lr)
         opt_scheduler = ReduceLROnPlateau(opt, factor = 0.5)
@@ -173,6 +185,7 @@ class VOS():
             idxs = torch.randperm(id_samples.shape[0])
             id_samples = id_samples[idxs]
             id_labels = id_labels[idxs]
+            id_samples, id_labels = id_samples.to(self.device), id_labels.to(self.device)
 
             opt.zero_grad()
 
