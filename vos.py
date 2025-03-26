@@ -8,17 +8,14 @@ from copy import deepcopy
 
 class VOS():
     def __init__(self, backbone, ood_detector, data, queue_size = 1024, device = "cuda"):
-        # Set up backbone and stripped backbone pretrained architectures
+        # Set up backbone pretrained architecture
+        # TODO: Include check that the backbone has the mode compliance
         self.backbone = backbone
-        backbone_layers = list(self.backbone.children())
-        self.feature_dim = backbone_layers[-1].in_features
-        del backbone_layers[-1]
-        self.stripped_backbone = nn.Sequential(*backbone_layers)
+        self.feature_dim = backbone.finalizer.in_features
 
         # Set up device and move networks there
         self.device = torch.device(device)
         self.backbone = self.backbone.to(self.device)
-        self.stripped_backbone = self.stripped_backbone.to(self.device)
 
         # Set up OOD detector architecture
         self.ood_detector = ood_detector.to(self.device)
@@ -53,7 +50,7 @@ class VOS():
         for key in self.queue.keys():
             class_samples = torch.stack(self.queue[key])
             class_samples = class_samples.to(self.device)
-            latent_embeddings = self.stripped_backbone(class_samples).squeeze()
+            latent_embeddings = self.backbone(class_samples, mode = "partial").squeeze()
 
             # Step 1: Get per class latent representation means
             self.means[key] = torch.mean(latent_embeddings, dim = 0).detach()
@@ -92,19 +89,18 @@ class VOS():
         for key in self.queue.keys():
             id_points = torch.stack(self.queue[key])
             id_points = id_points.to(self.device)
-            latents = self.stripped_backbone(id_points).squeeze().detach()
+            latents = self.backbone(id_points, mode = "partial").squeeze().detach()
             likelihoods = self.compute_gmm_log_likelihood(latents, key)
             id_likelihoods = torch.cat((id_likelihoods, likelihoods), dim = 0)
         log_epsilon = -torch.topk(-id_likelihoods, t).values[-1]
         return log_epsilon
 
     def sample_ood(self, max_iterations = 1000, lr = 5e-3):
-        self.stripped_backbone = self.stripped_backbone.to(self.device)
         for key in self.queue.keys():
             samples = deepcopy(self.queue[key])
             samples = torch.stack(samples)
             samples = samples.to(self.device)
-            latents = self.stripped_backbone(samples).detach().squeeze()
+            latents = self.backbone(samples, mode = "partial").detach().squeeze()
             latents.requires_grad = True
             opt = torch.optim.Adam([latents], lr = lr)
             eps = self.select_log_epsilon()
@@ -145,12 +141,6 @@ class VOS():
         ood_loss = torch.mean(-torch.log(1/(1 + torch.exp(-ood_energy_surface))))
 
         return (id_loss + ood_loss)
-
-    def update_stripped_backbone(self):
-        backbone_layers = list(self.backbone.children())
-        del backbone_layers[-1]
-        self.stripped_backbone = nn.Sequential(*backbone_layers)
-        return None
 
     def train(self, iterations = 50, lr = 1e-3, beta = 0.1, ood_iterations = 3):
         # Give a for loop for the iterations, and define the necessary stuff (optimizers, etc)
@@ -198,9 +188,6 @@ class VOS():
             opt.step()
             opt_scheduler.step(total_loss)
 
-            # Update stripped backbone network
-            self.update_stripped_backbone()
-
             average_uncertainty_loss = 0.
             for ood_iterate in range(ood_iterations):
                 ood_opt.zero_grad()
@@ -213,8 +200,5 @@ class VOS():
 
             print(f"Classification Loss: {class_loss}")
             print(f"Uncertainty Loss: {average_uncertainty_loss}")
-
-        # self.backbone.eval()
-        # self.ood_detector.eval()
 
         return None
