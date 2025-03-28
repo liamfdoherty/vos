@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import MultivariateNormal
 import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 from copy import deepcopy
@@ -21,7 +22,12 @@ class VOS():
         self.ood_detector = ood_detector.to(self.device)
 
         # Define dataset and split according to class label
-        samples, targets = data.tensors[0], data.tensors[1]
+        if type(data) is TensorDataset:
+            samples, targets = data.tensors[0], data.tensors[1]
+        elif type(data is DataLoader):
+            pass
+        else:
+            raise TypeError("Passed data must be either torch TensorDataset or DataLoader!")
         self.data_dict = {key:[] for key in targets.tolist()}
         for pair in zip(samples, targets):
             self.data_dict[int(pair[1])].append(pair[0])
